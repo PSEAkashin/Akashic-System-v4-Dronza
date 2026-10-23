@@ -1,0 +1,323 @@
+using System;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+
+namespace AKASHICSYSTEMDRONZA
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class CyanReversalBot : Robot
+    {
+        [Parameter("Risk (%)", DefaultValue = 1.0, MinValue = 0.01)]
+        public double RiskPercent { get; set; }
+
+        [Parameter("Required Bearish Candles", DefaultValue = 5, MinValue = 5)]
+        public int RequiredBearishCandles { get; set; }
+
+        [Parameter("Stop Buffer Below Green Open (Pips)", DefaultValue = 20, MinValue = 1)]
+        public double StopBufferPips { get; set; }
+
+        [Parameter("SMA Period", DefaultValue = 9, MinValue = 1)]
+        public int SmaPeriod { get; set; }
+
+        [Parameter("Exit Distance Above SMA (Pips)", DefaultValue = 600, MinValue = 1)]
+        public double ExitDistancePips { get; set; }
+
+        [Parameter("Bot Label", DefaultValue = "CyanReversalBot")]
+        public string BotLabel { get; set; }
+
+        private SimpleMovingAverage _sma;
+        private SimpleMovingAverage _sma20;
+        private SimpleMovingAverage _sma100;
+
+        private ChartIndicator _chartSma9;
+        private ChartIndicator _chartSma20;
+        private ChartIndicator _chartSma100;
+
+        private int _lastProcessedBar = -1;
+
+        protected override void OnStart()
+        {
+            if (Bars.TimeFrame != TimeFrame.Minute5)
+            {
+                Print("ERROR: Attach CyanReversalBot to an M5 chart.");
+                Stop();
+                return;
+            }
+
+            _sma = Indicators.SimpleMovingAverage(
+                Bars.ClosePrices, SmaPeriod);
+
+            _sma20 = Indicators.SimpleMovingAverage(
+                Bars.ClosePrices, 20);
+
+            _sma100 = Indicators.SimpleMovingAverage(
+                Bars.ClosePrices, 100);
+
+            _chartSma9 = Chart.Indicators.Add(
+                "Simple Moving Average", "Close", SmaPeriod);
+
+            _chartSma20 = Chart.Indicators.Add(
+                "Simple Moving Average", "Close", 20);
+
+            _chartSma100 = Chart.Indicators.Add(
+                "Simple Moving Average", "Close", 100);
+
+            _chartSma9.Lines[0].Color = Color.Yellow;
+            _chartSma9.Lines[0].Thickness = 2;
+
+            _chartSma20.Lines[0].Color = Color.Blue;
+            _chartSma20.Lines[0].Thickness = 2;
+
+            _chartSma100.Lines[0].Color = Color.Red;
+            _chartSma100.Lines[0].Thickness = 2;
+
+            Print("CyanReversalBot started on {0}, M5.", SymbolName);
+            Print("Risk: {0}% | Required bearish candles: {1}",
+                RiskPercent, RequiredBearishCandles);
+            Print("Entry trend filter: SMA(50) must be above SMA(100).");
+        }
+
+        protected override void OnBar()
+        {
+            // The last fully closed candle.
+            int index = Bars.Count - 2;
+
+            // Wait until sufficient historical data is available.
+            int minimumLookback = Math.Max(
+                100,
+                Math.Max(SmaPeriod, RequiredBearishCandles + 2));
+
+            if (index < minimumLookback)
+                return;
+
+            if (index <= _lastProcessedBar)
+                return;
+
+            _lastProcessedBar = index;
+
+            ManageClosedBarExit(index);
+
+            // Do not open another position while one is active.
+            if (GetBotPosition() != null)
+                return;
+
+            CheckEntrySignal(index);
+        }
+
+        protected override void OnTick()
+        {
+            Position position = GetBotPosition();
+
+            if (position == null)
+                return;
+
+            int index = Bars.Count - 2;
+
+            if (index < 100 || index < SmaPeriod)
+                return;
+
+            double smaValue = _sma.Result[index];
+
+            double targetPrice =
+                smaValue + ExitDistancePips * Symbol.PipSize;
+
+            if (Symbol.Bid >= targetPrice)
+            {
+                Print(
+                    "EXIT: Price reached SMA({0}) + {1} pips.",
+                    SmaPeriod,
+                    ExitDistancePips);
+
+                ClosePosition(position);
+            }
+        }
+
+        private void CheckEntrySignal(int index)
+        {
+            // NEW CONDITION:
+            // Allow BUY trades only when SMA(50) > SMA(100).
+            double sma50Value = _sma20.Result[index];
+            double sma100Value = _sma100.Result[index];
+
+            if (sma50Value <= sma100Value)
+            {
+                Print(
+                    "Entry blocked: SMA(20) ({0}) is not above SMA(100) ({1}).",
+                    sma50Value,
+                    sma100Value);
+
+                return;
+            }
+
+            // The signal candle must be bullish.
+            double greenOpen = Bars.OpenPrices[index];
+            double greenClose = Bars.ClosePrices[index];
+
+            if (greenClose <= greenOpen)
+                return;
+
+            // Verify the required consecutive bearish candles.
+            int firstRed = index - RequiredBearishCandles;
+
+            for (int i = firstRed; i < index; i++)
+            {
+                // Each preceding candle must be bearish.
+                if (Bars.ClosePrices[i] >= Bars.OpenPrices[i])
+                {
+                    Print(
+                        "Entry rejected: not {0} consecutive bearish candles.",
+                        RequiredBearishCandles);
+
+                    return;
+                }
+
+                // Bearish candle closes must be strictly descending.
+                if (i > firstRed &&
+                    Bars.ClosePrices[i] >= Bars.ClosePrices[i - 1])
+                {
+                    Print(
+                        "Entry rejected: bearish closes are not strictly decreasing.");
+
+                    return;
+                }
+            }
+
+            // The bullish candle must engulf the bodies
+            // of the two immediately preceding bearish candles.
+            int red1 = index - 1;
+            int red2 = index - 2;
+
+            double lowerBodyBoundary = Math.Min(
+                Bars.ClosePrices[red1],
+                Bars.ClosePrices[red2]);
+
+            double upperBodyBoundary = Math.Max(
+                Bars.OpenPrices[red1],
+                Bars.OpenPrices[red2]);
+
+            bool engulfsBothBodies =
+                greenOpen <= lowerBodyBoundary &&
+                greenClose >= upperBodyBoundary;
+
+            if (!engulfsBothBodies)
+            {
+                Print(
+                    "Entry rejected: green candle did not engulf both red bodies.");
+
+                return;
+            }
+
+            // Set the stop price a specified number of pips
+            // below the bullish signal candle's OPEN.
+            double stopPrice =
+                greenOpen - StopBufferPips * Symbol.PipSize;
+
+            double estimatedEntry = Symbol.Ask;
+
+            double stopLossPips =
+                (estimatedEntry - stopPrice) / Symbol.PipSize;
+
+            if (stopLossPips <= 0)
+            {
+                Print("Entry cancelled: invalid stop-loss distance.");
+                return;
+            }
+
+            // Calculate position size from account equity and risk.
+            double riskAmount =
+                Account.Equity * RiskPercent / 100.0;
+
+            double volume = Symbol.VolumeForFixedRisk(
+                riskAmount,
+                stopLossPips,
+                RoundingMode.Down);
+
+            volume = Symbol.NormalizeVolumeInUnits(
+                volume,
+                RoundingMode.Down);
+
+            if (volume < Symbol.VolumeInUnitsMin)
+            {
+                Print(
+                    "Entry cancelled: calculated volume is below minimum.");
+
+                return;
+            }
+
+            if (volume > Symbol.VolumeInUnitsMax)
+                volume = Symbol.VolumeInUnitsMax;
+
+            Print("BUY SIGNAL CONFIRMED.");
+            Print("SMA(20): {0} | SMA(100): {1}",
+                sma50Value, sma100Value);
+            Print(
+                "Conditions: descending bearish candles + bullish engulfing.");
+            Print("Green open: {0} | Green close: {1}",
+                greenOpen, greenClose);
+            Print("Stop price: {0} | SL distance: {1:F1} pips",
+                stopPrice, stopLossPips);
+            Print("Risk amount: {0:F2} | Volume: {1}",
+                riskAmount, volume);
+
+            TradeResult result = ExecuteMarketOrder(
+                TradeType.Buy,
+                SymbolName,
+                volume,
+                BotLabel,
+                stopLossPips,
+                null);
+
+            if (result.IsSuccessful)
+            {
+                Print(
+                    "BUY OPENED at {0}. SL distance: {1:F1} pips.",
+                    result.Position.EntryPrice,
+                    stopLossPips);
+            }
+            else
+            {
+                Print("Order failed: {0}", result.Error);
+            }
+        }
+
+        private void ManageClosedBarExit(int index)
+        {
+            Position position = GetBotPosition();
+
+            if (position == null)
+                return;
+
+            double open = Bars.OpenPrices[index];
+            double close = Bars.ClosePrices[index];
+            double smaValue = _sma.Result[index];
+
+            bool isRed = close < open;
+
+            // Exit if a bearish candle closes below SMA(9).
+            if (isRed && close < smaValue)
+            {
+                Print(
+                    "EXIT: Red candle closed below SMA({0}).",
+                    SmaPeriod);
+
+                ClosePosition(position);
+            }
+        }
+
+        private Position GetBotPosition()
+        {
+            foreach (Position position in Positions)
+            {
+                if (position.SymbolName == SymbolName &&
+                    position.Label == BotLabel &&
+                    position.TradeType == TradeType.Buy)
+                {
+                    return position;
+                }
+            }
+
+            return null;
+        }
+    }
+}
